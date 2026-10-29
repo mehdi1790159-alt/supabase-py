@@ -90,7 +90,10 @@ class AsyncPush:
 
     def receive(self, status, callback) -> AsyncPush:
         if (received := self.received_resp) and received[0] == status:
-            callback(received[1])
+            if status == RealtimeAcknowledgementStatus.Timeout:
+                callback()
+            else:
+                callback(received[1])
         else:
             if status == RealtimeAcknowledgementStatus.Ok:
                 self.ok_callbacks.append(callback)
@@ -108,6 +111,7 @@ class AsyncPush:
 
         async def timeout(self):
             await asyncio.sleep(self.timeout)
+            self.timeout_task = None
             self.trigger(RealtimeAcknowledgementStatus.Timeout, {})
             if self.ref and self.ref in self.channel.messages_waiting_for_ack:
                 del self.channel.messages_waiting_for_ack[self.ref]

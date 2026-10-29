@@ -1,4 +1,5 @@
 import re
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -14,7 +15,16 @@ from httpx import (
 )
 
 from postgrest import AsyncPostgrestClient
+from postgrest.constants import DEFAULT_POSTGREST_CLIENT_TIMEOUT
 from postgrest.exceptions import APIError
+
+from ..credentials import (
+    BASIC_AUTHORIZATION,
+    BEARER_AUTHORIZATION,
+    PASSWORD,
+    TOKEN,
+    USERNAME,
+)
 
 
 @pytest.fixture
@@ -47,6 +57,14 @@ class TestConstructor:
             }
         )
         assert session.headers.items() >= headers.items()
+
+    @pytest.mark.asyncio
+    async def test_default_timeout_uses_postgrest_constant(self) -> None:
+        async with AsyncPostgrestClient("https://example.com") as client:
+            assert client.timeout == DEFAULT_POSTGREST_CLIENT_TIMEOUT
+            assert client.session.timeout == Timeout(
+                timeout=DEFAULT_POSTGREST_CLIENT_TIMEOUT
+            )
 
     @pytest.mark.asyncio
     async def test_custom_headers(self):
@@ -92,17 +110,14 @@ class TestHttpxClientConstructor:
 
 class TestAuth:
     def test_auth_token(self, postgrest_client: AsyncPostgrestClient):
-        postgrest_client.auth("s3cr3t")
-        assert postgrest_client.headers["Authorization"] == "Bearer s3cr3t"
+        postgrest_client.auth(TOKEN)
+        assert postgrest_client.headers["Authorization"] == BEARER_AUTHORIZATION
 
     def test_auth_basic(self, postgrest_client: AsyncPostgrestClient):
-        postgrest_client.auth(None, username="admin", password="s3cr3t")
+        postgrest_client.auth(None, username=USERNAME, password=PASSWORD)
 
         assert isinstance(postgrest_client.basic_auth, BasicAuth)
-        assert (
-            postgrest_client.basic_auth._auth_header
-            == BasicAuth("admin", "s3cr3t")._auth_header
-        )
+        assert postgrest_client.basic_auth._auth_header == BASIC_AUTHORIZATION
 
 
 def test_schema(postgrest_client: AsyncPostgrestClient):
@@ -176,3 +191,55 @@ async def test_response_client_invalid_response_but_valid_json(
         assert isinstance(exc_response.get("message"), str)
         assert exc_response.get("message") == "JSON could not be generated"
         assert "code" in exc_response and int(exc_response["code"]) == 502
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body, message, details",
+    [
+        (b'{"message": "JWT expired"}', "JWT expired", None),
+        (
+            b'{"code": "PGRST201", "details": [{"x": 1}], "hint": null, "message": "m"}',
+            "m",
+            [{"x": 1}],
+        ),
+    ],
+)
+async def test_response_error_json_missing_or_non_string_fields(
+    postgrest_client: AsyncPostgrestClient, body, message, details
+):
+    with patch(
+        "httpx._client.AsyncClient.request",
+        return_value=Response(
+            status_code=400,
+            content=body,
+            request=Request(method="GET", url="http://example.com"),
+        ),
+    ):
+        with pytest.raises(APIError) as exc_info:
+            await postgrest_client.from_("test").select("a").execute()
+        assert exc_info.value.message == message
+        assert exc_info.value.details == details
+
+
+@pytest.mark.parametrize("head", [False, True])
+def test_rpc_query_params_send_lists_as_array_literals(
+    postgrest_client: AsyncPostgrestClient, head: bool
+):
+    params: Any = {"ids": [1, 2, 3], "name": "x"}
+    builder = postgrest_client.rpc("sum_ids", params, head=head, get=not head)
+
+    assert builder.request.params.get_list("ids") == ["{1,2,3}"]
+    assert builder.request.params["name"] == "x"
+
+
+@pytest.mark.parametrize("head", [False, True])
+def test_rpc_query_params_quote_array_elements(
+    postgrest_client: AsyncPostgrestClient, head: bool
+):
+    params: Any = {"tags": ["a,b", "c d", "", 'say "hi"', "x}", "null", None]}
+    builder = postgrest_client.rpc("tag_fn", params, head=head, get=not head)
+
+    assert builder.request.params.get_list("tags") == [
+        '{"a,b","c d","","say \\"hi\\"","x}","null",NULL}'
+    ]

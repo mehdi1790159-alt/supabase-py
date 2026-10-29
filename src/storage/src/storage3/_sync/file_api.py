@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Literal, Optional, Union, cast
 from httpx import Client, Headers, HTTPStatusError, Response
 from yarl import URL
 
-from ..constants import DEFAULT_FILE_OPTIONS, DEFAULT_SEARCH_OPTIONS
+from ..constants import DEFAULT_FILE_OPTIONS, DEFAULT_SEARCH_OPTIONS, DEFAULT_SORT_BY
 from ..exceptions import StorageApiError
 from ..types import (
     BaseBucket,
@@ -88,10 +88,6 @@ class SyncBucketActionsMixin:
                 raise StorageApiError(
                     message, "InternalError", exc.response.status_code
                 ) from err
-
-        # close the resource before returning the response
-        if files and "file" in files and isinstance(files["file"][1], BufferedReader):
-            files["file"][1].close()
 
         return response
 
@@ -185,25 +181,27 @@ class SyncBucketActionsMixin:
             or isinstance(file, bytes)
             or isinstance(file, FileIO)
         ):
-            # bytes or byte-stream-like object received
+            # bytes or byte-stream-like object received -- the caller owns it
+            opened = None
             _file = {"file": (filename, file, content_type)}
         else:
-            # str or pathlib.path received
-            _file = {
-                "file": (
-                    filename,
-                    open(file, "rb"),
-                    content_type,
-                )
-            }
-        response = self._request(
-            "PUT",
-            final_url,
-            files=_file,
-            headers=headers,
-            data=_data,
-            query_params=query_params,
-        )
+            # str or pathlib.path received -- we own the handle, so we close it
+            opened = open(file, "rb")
+            _file = {"file": (filename, opened, content_type)}
+
+        try:
+            response = self._request(
+                "PUT",
+                final_url,
+                files=_file,
+                headers=headers,
+                data=_data,
+                query_params=query_params,
+            )
+        finally:
+            if opened is not None:
+                opened.close()
+
         data: UploadData = response.json()
 
         return UploadResponse(path=path, Key=data["Key"])
@@ -446,6 +444,10 @@ class SyncBucketActionsMixin:
         body = {
             **DEFAULT_SEARCH_OPTIONS,
             **extra_options,
+            "sortBy": {
+                **DEFAULT_SORT_BY,
+                **extra_options.get("sortBy", {}),
+            },
             "prefix": path or "",
         }
         response = self._request(
@@ -560,21 +562,25 @@ class SyncBucketActionsMixin:
             or isinstance(file, bytes)
             or isinstance(file, FileIO)
         ):
-            # bytes or byte-stream-like object received
+            # bytes or byte-stream-like object received -- the caller owns it
+            opened = None
             files = {"file": (filename, file, content_type)}
         else:
-            # str or pathlib.path received
-            files = {
-                "file": (
-                    filename,
-                    open(file, "rb"),
-                    content_type,
-                )
-            }
+            # str or pathlib.path received -- we own the handle, so we close it
+            opened = open(file, "rb")
+            files = {"file": (filename, opened, content_type)}
 
-        response = self._request(
-            method, ["object", self.id, *path], files=files, headers=headers, data=_data
-        )
+        try:
+            response = self._request(
+                method,
+                ["object", self.id, *path],
+                files=files,
+                headers=headers,
+                data=_data,
+            )
+        finally:
+            if opened is not None:
+                opened.close()
 
         data: UploadData = response.json()
 

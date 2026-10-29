@@ -12,7 +12,7 @@ from datetime import datetime
 from typing import Any, Dict, Optional, Type, TypedDict, TypeVar, Union
 from urllib.parse import urlparse
 
-from httpx import HTTPStatusError, Response
+from httpx import HTTPStatusError, RequestError, Response
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from .constants import (
@@ -132,16 +132,26 @@ def get_error_message(error: Any) -> str:
     return next((error[prop] for prop in props if filter(prop)), str(error))
 
 
-def handle_exception(error: HTTPStatusError | RuntimeError) -> AuthError:
+def handle_exception(
+    error: HTTPStatusError | RequestError | RuntimeError,
+) -> AuthError:
     if not isinstance(error, HTTPStatusError):
         return AuthRetryableError(get_error_message(error), 0)
     try:
         network_error_codes = [502, 503, 504, 520, 521, 522, 523, 524, 530]
-        if error.response.status_code in network_error_codes:
-            return AuthRetryableError(
-                get_error_message(error), error.response.status_code
-            )
-        data = error.response.json()
+        status = error.response.status_code
+        try:
+            data = error.response.json()
+        except Exception:
+            if status in network_error_codes:
+                # The reason phrase is empty when the server sends none and
+                # the status is non-standard (e.g. Cloudflare's 520-530).
+                return AuthRetryableError(
+                    error.response.reason_phrase or f"HTTP {status}", status
+                )
+            raise
+        if status in network_error_codes:
+            return AuthRetryableError(get_error_message(data), status)
 
         error_code = None
         response_api_version = parse_response_api_version(error.response)
@@ -163,18 +173,25 @@ def handle_exception(error: HTTPStatusError | RuntimeError) -> AuthError:
             error_code = data.get("error_code")
 
         if error_code is None:
+            # Legacy support for weak password errors, from before error codes
+            # existed: the reasons are only carried by the `weak_password` object.
+            weak_password = (
+                data.get("weak_password") if isinstance(data, dict) else None
+            )
+            reasons = (
+                weak_password.get("reasons")
+                if isinstance(weak_password, dict)
+                else None
+            )
             if (
-                isinstance(data, dict)
-                and data
-                and isinstance(data.get("weak_password"), dict)
-                and data.get("weak_password")
-                and isinstance(data.get("weak_password"), list)
-                and len(data["weak_password"])
+                isinstance(reasons, list)
+                and reasons
+                and all(isinstance(reason, str) for reason in reasons)
             ):
                 return AuthWeakPasswordError(
                     get_error_message(data),
                     error.response.status_code,
-                    data["weak_password"].get("reasons"),
+                    reasons,
                 )
         elif error_code == "weak_password":
             return AuthWeakPasswordError(
